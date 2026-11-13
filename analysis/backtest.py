@@ -1,5 +1,8 @@
 """Rolling-origin backtest of LightGBM + CQR on the hub dengue series.
 
+Features include lag-1 ENSO/ERA5 climate (see models.lgbm_cqr.build_features).
+The target remains the hub case series.
+
 Default evaluation window: monthly origins from 2023-09 through the last
 origin that still has lead-5 observed (2026-04 given last obs 2026-09).
 Raw forecasts begin earlier so the CQR window is warm by the first
