@@ -25,10 +25,13 @@ QUANTILES = np.array([
 ])
 QCOLS = [f"q_{q}" for q in QUANTILES]
 
+# Warm Okabe–Ito anchors. Vermillion is the submitted model; orange/gold is the
+# raw comparison. Interval fills reuse the vermillion at low alpha (peach wash).
 COL = {
-    "lightgbm_cqr": "#0072B2",
-    "lightgbm": "#56B4E9",
+    "lightgbm_cqr": "#D55E00",
+    "lightgbm": "#E69F00",
 }
+OBSERVED = "#3C2415"
 LABEL = {
     "lightgbm_cqr": "LightGBM+CQR (submitted)",
     "lightgbm": "LightGBM",
@@ -283,7 +286,7 @@ def fig_backtest_series(fair: pd.DataFrame) -> None:
         ax.fill_between(t, sub["q_0.025"], sub["q_0.975"], color=COL["lightgbm_cqr"], alpha=0.18, lw=0, label="95% interval", zorder=1)
         ax.fill_between(t, sub["q_0.25"], sub["q_0.75"], color=COL["lightgbm_cqr"], alpha=0.32, lw=0, label="50% interval", zorder=2)
         ax.plot(t, sub["q_0.5"], color=COL["lightgbm_cqr"], lw=1.15, label="Median forecast", zorder=3)
-        ax.plot(t, sub["actual"], color="black", lw=1.0, marker="o", ms=2.0, mew=0, label="Observed", zorder=4)
+        ax.plot(t, sub["actual"], color=OBSERVED, lw=1.0, marker="o", ms=2.0, mew=0, label="Observed", zorder=4)
         ax.set_ylabel("Monthly dengue cases")
         ax.set_ylim(0, None)
         ax.xaxis.set_major_locator(YearLocator(base=1))
@@ -323,7 +326,7 @@ def fig_submission_fan() -> None:
     last_y = float(den.loc[den["target_end_date"] == last, "observation"].iloc[0])
 
     fig, ax = plt.subplots(figsize=(7.2, 3.25))
-    ax.plot(hist["target_end_date"], hist["observation"], color="black", lw=1.15, label="Observed", zorder=4)
+    ax.plot(hist["target_end_date"], hist["observation"], color=OBSERVED, lw=1.15, label="Observed", zorder=4)
     t = wide.index
     ax.fill_between(t, wide[0.025], wide[0.975], color=COL["lightgbm_cqr"], alpha=0.18, lw=0, label="95% interval", zorder=1)
     ax.fill_between(t, wide[0.25], wide[0.75], color=COL["lightgbm_cqr"], alpha=0.32, lw=0, label="50% interval", zorder=2)
