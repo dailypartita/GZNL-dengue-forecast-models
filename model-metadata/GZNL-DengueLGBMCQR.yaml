@@ -1,0 +1,15 @@
+team_name: "GZNL Group"
+team_abbr: "GZNL"
+model_name: "Dengue LightGBM Conformal Quantile Regression"
+model_abbr: "DengueLGBMCQR"
+model_contributors:
+  - name: "GZNL Group"
+    affiliation: "GZNL Group"
+    email: "gznl@example.com"
+license: "CC-BY-4.0"
+designated_model: false
+data_inputs: "Monthly national dengue case counts from this hub's target-data/time-series.csv (China CDC notifiable-disease reports / cn_cdc_dashboard). No extra covariates; lag and calendar features are built only from that series."
+methods: "Per-horizon LightGBM quantile regression (23 hub quantiles) on log1p dengue counts with lag/calendar features, plus online sliding-window CQR on complementary quantile pairs."
+methods_long: "GZNL-DengueLGBMCQR is a per-horizon LightGBM quantile regression model with online conformalized quantile regression (CQR), trained on the hub's monthly national dengue series (mo inc dengue cases, location CN) through 2026-09 for the 2026-11-01 round. At each origin month t the feature set uses only observations available at t: lag1, lag2, lag3, lag6, lag12, the trailing 3- and 12-month means (r3m, r12m), the first difference d1 = lag1-lag2, and month-of-year Fourier terms (cal_sin1, cal_cos1). No climate, ENSO, or other external covariates are used. For each model lead h = 1,...,5 a separate LightGBM is trained at every required hub quantile (0.01, 0.025, 0.05, ..., 0.99; 23 levels) with objective='quantile', n_estimators=300, learning_rate=0.05, num_leaves=15 and min_child_samples=5. Training is in log1p space and predictions are mapped back with expm1 and clipped at 0; a monotone rearrangement (np.maximum.accumulate) removes quantile crossing. Because the last hub observation is 2026-09-01, hub horizons -1, 0, 1, 2, 3 for reference_date 2026-11-01 correspond to model leads 1 through 5 (target months 2026-10 through 2027-02). After the raw LightGBM quantiles are produced, CQR is applied online to every complementary pair (q, 1-q) with q<0.5: the conformity score is S=max(q_lo-y, y-q_hi), and the adjustment Q is the empirical quantile of the last 24 origin scores at level ceil((n+1)*(1-alpha))/n with alpha=2q and method='higher'. The interval is expanded to [q_lo-Q, q_hi+Q], the lower bound is clipped at 0, and the median (0.5) is left unchanged. A short burn-in of 10 origins is required before CQR is switched on. After CQR the 23 quantiles are again made monotone and non-negative and rounded to integer case counts. On a monthly rolling-origin backtest (origins 2023-09 through 2026-04, leads 1-5, 160 origin-horizon pairs) the CQR forecasts have mean WIS 551 versus 572 for the uncalibrated LightGBM quantiles, with 50/90% interval coverage of 51/98% (raw: 25/60%)."
+ensemble_of_models: false
+ensemble_of_hub_models: false
