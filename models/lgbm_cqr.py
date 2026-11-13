@@ -1,10 +1,11 @@
 """LightGBM quantile regression with sliding-window conformalized quantile regression.
 
 Train one LightGBM quantile model per (horizon lead, hub quantile) on log1p
-counts, using lag and calendar features available at the origin month (no
-leakage).  After raw quantile prediction, apply online CQR on every
-complementary pair (q, 1-q), then enforce monotonicity, non-negativity, and
-integer counts.
+counts.  Features at origin month t are case lags and calendar terms known at
+t, plus lag-1 climate (ENSO ONI and ERA5 China temperature, precipitation, and
+relative humidity of month t-1).  No future climate is used at any lead.
+After raw quantile prediction, apply online CQR on every complementary pair
+(q, 1-q), then enforce monotonicity, non-negativity, and integer counts.
 """
 
 from __future__ import annotations
@@ -31,8 +32,18 @@ from models.hub import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = ROOT / "data" / "time-series.csv"
+ENSO_PATH = ROOT / "data" / "covariates_enso.csv"
+ERA5_PATH = ROOT / "data" / "covariates_era5_china.csv"
 OUTPUT_DIR = ROOT / "output" / MODEL_ID
 
+# Case lags use the same convention as the lag-only model: at origin t,
+# lag1 = y_t and lag12 = y_{t-11}.  Climate lags are the covariate month t-1.
+CLIMATE_LAG_COLS = (
+    "enso_oni_l1",
+    "temp_mean_l1",
+    "precip_mean_l1",
+    "rel_humid_mean_l1",
+)
 FEATURE_COLS = (
     "lag1",
     "lag2",
@@ -44,7 +55,14 @@ FEATURE_COLS = (
     "d1",
     "cal_sin1",
     "cal_cos1",
+    *CLIMATE_LAG_COLS,
 )
+CLIMATE_SOURCE_COLS = {
+    "enso_oni_l1": "enso_oni",
+    "temp_mean_l1": "temp_mean",
+    "precip_mean_l1": "precip_mean",
+    "rel_humid_mean_l1": "rel_humid_mean",
+}
 
 CALIB_W = 24
 BURN_IN = 10
@@ -68,14 +86,108 @@ def shift_months(dates, months: int) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(dates) + pd.DateOffset(months=int(months))
 
 
-def build_features(y: pd.Series) -> pd.DataFrame:
-    """Features at origin month t, using only observations up to t.
+def _as_month_start(values) -> pd.DatetimeIndex:
+    idx = pd.DatetimeIndex(pd.to_datetime(values))
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    idx = idx.normalize()
+    if len(idx) and not ((idx.day == 1).all()):
+        raise ValueError("climate months must be dated on the first of the month")
+    return idx
 
-    lag_k is the k-th most recent observation (lag1 = y_t, lag12 = y_{t-11}).
+
+def load_climate_covariates(
+    enso_path: str | Path = ENSO_PATH,
+    era5_path: str | Path = ERA5_PATH,
+) -> pd.DataFrame:
+    """Load contemporaneous monthly climate, indexed by month start.
+
+    ENSO is NOAA ONI.  ERA5 is the China series only (geo_name China / iso3 CHN).
+    Values are not lagged and are not imputed; the lag is applied in
+    ``build_features``.
+    """
+    enso_path = Path(enso_path)
+    era5_path = Path(era5_path)
+    if not enso_path.exists() or not era5_path.exists():
+        raise FileNotFoundError(f"missing climate files: {enso_path} , {era5_path}")
+
+    enso = pd.read_csv(enso_path)
+    era = pd.read_csv(era5_path)
+    if "month" not in enso.columns or "enso_oni" not in enso.columns:
+        raise ValueError(f"{enso_path.name} must contain month and enso_oni")
+    needed_era = {"month", "temp_mean", "precip_mean", "rel_humid_mean"}
+    missing = needed_era - set(era.columns)
+    if missing:
+        raise ValueError(f"{era5_path.name} missing columns: {sorted(missing)}")
+    if "geo_name" in era.columns and not era["geo_name"].eq("China").all():
+        raise ValueError(f"{era5_path.name} must be China-only")
+    if "iso3" in era.columns and not era["iso3"].eq("CHN").all():
+        raise ValueError(f"{era5_path.name} must be iso3 CHN only")
+
+    enso = enso.copy()
+    era = era.copy()
+    enso.index = _as_month_start(enso["month"])
+    era.index = _as_month_start(era["month"])
+    if enso.index.has_duplicates:
+        raise ValueError("duplicate ENSO months")
+    if era.index.has_duplicates:
+        raise ValueError("duplicate ERA5 China months")
+    if enso["enso_oni"].isna().any() or era[["temp_mean", "precip_mean", "rel_humid_mean"]].isna().any().any():
+        raise ValueError("climate files contain missing values; refusing to impute")
+
+    climate = pd.DataFrame(index=enso.index.union(era.index).sort_values())
+    climate["enso_oni"] = enso["enso_oni"].astype(float)
+    for col in ("temp_mean", "precip_mean", "rel_humid_mean"):
+        climate[col] = era[col].astype(float)
+    climate = climate.sort_index()
+    climate.index.name = "month"
+    return climate
+
+
+def lag1_climate(climate: pd.DataFrame, index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Put month t-1 climate onto origin month t.  Missing months stay NA."""
+    out = pd.DataFrame(index=pd.DatetimeIndex(index))
+    shifted = climate.copy()
+    shifted.index = pd.DatetimeIndex(climate.index) + pd.DateOffset(months=1)
+    if shifted.index.has_duplicates:
+        raise ValueError("duplicate months after shifting climate forward by one month")
+    for dst, src in CLIMATE_SOURCE_COLS.items():
+        out[dst] = shifted[src].reindex(out.index)
+    return out
+
+
+def assert_climate_lag(feat: pd.DataFrame, climate: pd.DataFrame) -> None:
+    """Every origin's climate feature equals the covariate of the previous month."""
+    for dst, src in CLIMATE_SOURCE_COLS.items():
+        expected = climate[src].copy()
+        expected.index = pd.DatetimeIndex(climate.index) + pd.DateOffset(months=1)
+        got = feat[dst]
+        both = got.notna()
+        aligned = expected.reindex(got.index)
+        if not np.allclose(
+            got.loc[both].to_numpy(dtype=float),
+            aligned.loc[both].to_numpy(dtype=float),
+            equal_nan=False,
+        ):
+            raise AssertionError(f"{dst} is not the lag-1 value of {src}")
+        # A non-null feature must come from a real previous month, never a fill.
+        if bool((both & aligned.isna()).any()):
+            raise AssertionError(f"{dst} has a value with no month t-1 source")
+
+
+def build_features(y: pd.Series, climate: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Features at origin month t, using only information known at t.
+
+    lag_k is the k-th most recent case count (lag1 = y_t, lag12 = y_{t-11}).
     r3m / r12m are trailing means of the last 3 / 12 observed months.
     d1 = lag1 - lag2.  Fourier terms use the origin calendar month.
+    Climate columns are the covariate values of month t-1.  ERA5 China starts
+    in 2010-01, so earlier origins have NA climate and are dropped later.
+    Nothing is imputed, and no lead uses climate from after t-1.
     """
     y = y.astype(float).sort_index()
+    if climate is None:
+        climate = load_climate_covariates()
     feat = pd.DataFrame(index=y.index)
     feat["lag1"] = y
     feat["lag2"] = y.shift(1)
@@ -88,6 +200,9 @@ def build_features(y: pd.Series) -> pd.DataFrame:
     month = feat.index.month.astype(float)
     feat["cal_sin1"] = np.sin(2.0 * np.pi * month / 12.0)
     feat["cal_cos1"] = np.cos(2.0 * np.pi * month / 12.0)
+    clim = lag1_climate(climate, feat.index)
+    for col in CLIMATE_LAG_COLS:
+        feat[col] = clim[col]
     return feat[list(FEATURE_COLS)]
 
 
@@ -368,6 +483,33 @@ def main() -> None:
     print(f"Loading {DATA_PATH}")
     y = load_dengue_series(DATA_PATH)
     print(f"Dengue series: {y.index.min().date()} .. {y.index.max().date()}  n={len(y)}")
+    climate = load_climate_covariates()
+    print(
+        "ENSO ONI: "
+        f"{climate['enso_oni'].dropna().index.min().date()} .. "
+        f"{climate['enso_oni'].dropna().index.max().date()}  "
+        f"n={int(climate['enso_oni'].notna().sum())}"
+    )
+    era_ok = climate[["temp_mean", "precip_mean", "rel_humid_mean"]].dropna()
+    print(
+        "ERA5 China: "
+        f"{era_ok.index.min().date()} .. {era_ok.index.max().date()}  n={len(era_ok)}"
+    )
+    feat = build_features(y, climate)
+    assert_climate_lag(feat, climate)
+    complete = feat.dropna()
+    print(
+        "Complete feature rows (dropna, no imputation): "
+        f"{complete.index.min().date()} .. {complete.index.max().date()}  n={len(complete)}"
+    )
+    origin = pd.Timestamp(y.index.max())
+    prev = origin - pd.DateOffset(months=1)
+    for dst, src in CLIMATE_SOURCE_COLS.items():
+        got = float(feat.loc[origin, dst])
+        exp = float(climate.loc[prev, src])
+        if got != exp:
+            raise AssertionError(f"{dst} at {origin.date()} is {got}, expected {src} at {prev.date()} = {exp}")
+        print(f"  {dst}({origin.date()}) = {src}({prev.date()}) = {got}")
     expected_tail = {
         pd.Timestamp("2026-01-01"): 93.0,
         pd.Timestamp("2026-02-01"): 94.0,
@@ -385,7 +527,11 @@ def main() -> None:
     if y.index.max() != pd.Timestamp("2026-09-01"):
         raise ValueError(f"expected last obs 2026-09-01, got {y.index.max().date()}")
 
-    submission, rolling = forecast_round(y)
+    for lead in MODEL_LEADS:
+        X, _y_tgt = _training_xy(feat, y, origin, lead)
+        print(f"  training rows at {origin.date()} lead={lead}: {len(X)}")
+
+    submission, rolling = forecast_round(y, feat=feat)
     out_csv = OUTPUT_DIR / f"{REFERENCE_DATE.strftime('%Y-%m-%d')}-{MODEL_ID}.csv"
     write_hub_file(submission, out_csv, reference_date=REFERENCE_DATE)
     roll_path = OUTPUT_DIR / "rolling_raw_cqr.csv"
